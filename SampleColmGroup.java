@@ -10,6 +10,11 @@ public class SampleColmGroup implements ColmGroup {
         return GROUPING_COLUMNS;
     }
 
+    @Override
+    public boolean isInMemoryProcessingRequired() {
+        return true;
+    }
+
     /**
      * 두 레코드가 동일한 그룹에 속하는지 확인합니다.
      * GROUPING_COLUMNS에 정의된 모든 열의 값이 같아야 동일한 그룹으로 판단합니다.

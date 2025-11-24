@@ -1,22 +1,26 @@
 public interface ColmGroup {
     int[] getGroupingColms();
 
-    default boolean isSameGroup(String[] prev, String[] record) {  
-        for (int i = 0; i < getGroupingColms().length; i++) {  
-		    if (!prev[i].equals(record[i])) {  
-			    return false;  
-            }  
-        }  
-        return true;  
-    }  
+    default boolean isInMemoryProcessingRequired() {
+        return false;
+    }
 
-    String[] accumulate(String[] prev, String[] record);  
-  
-    default void scale(String[] prev) {  
-	    // does nothing by default  
-    }  
+    default boolean isSameGroup(String[] prev, String[] record) {
+        for (int i = 0; i < getGroupingColms().length; i++) {
+		    if (!prev[i].equals(record[i])) {
+			    return false;
+            }
+        }
+        return true;
+    }
 
-    default int[] rangeList(int count) {  
+    String[] accumulate(String[] prev, String[] record);
+
+    default void scale(String[] prev) {
+	    // does nothing by default
+    }
+
+    default int[] rangeList(int count) {
         return java.util.stream.IntStream.range(0, count).toArray();
     }
 

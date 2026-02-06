@@ -129,7 +129,7 @@ public class PivotSharedItemsFlattener
                 // CSV 형식에 맞게 값에 쉼표나 큰따옴표가 포함된 경우 처리
                 if (value.Contains(",") || value.Contains("\"") || value.Contains("\n")) // 줄바꿈도 고려
                 {
-                    sb.Append($"\"{value.Replace("\"", "\"\")}\"");
+                    // sb.Append($"\"{value.Replace("\"", "\"\")}\"");
                 }
                 else
                 {

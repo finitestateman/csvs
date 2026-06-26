@@ -1,0 +1,36 @@
+name: Deploy Dev
+
+on:
+  push:
+    branches:
+      - dev
+
+jobs:
+  deploy:
+    runs-on:
+      - self-hosted
+      - Linux
+      - X64
+      - dev
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Deploy
+        run: |
+          cd /appdata/appuser/brand-llm
+
+          git fetch
+          git checkout dev
+          git pull origin dev
+
+          if [ ! -d venv ]; then
+              python3 -m venv .venv
+          fi
+
+          source .venv/bin/activate
+
+          pip install -U pip
+          pip install -r requirements.txt --upgrade-strategy only-if-needed
+
+          nohup fastapi dev > "$(date +%Y%m%d_%H%M%S).log" 2>&>1 &

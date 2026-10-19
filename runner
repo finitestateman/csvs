@@ -1,0 +1,220 @@
+"""Streaming sink. The source retains responsibility for extraction and sweep logic."""
+import dataclasses
+import json
+import logging
+import math
+from datetime import date, datetime
+from pathlib import Path
+
+from etl.constants import MODES
+
+
+def json_value(value):
+    if dataclasses.is_dataclass(value):
+        return dataclasses.asdict(value)
+    if isinstance(value, (date, datetime)):
+        return value.isoformat()
+    raise TypeError(f"Unsupported record value: {type(value).__name__}")
+
+
+def encode(value):
+    return json.dumps(value, default=json_value, ensure_ascii=False, allow_nan=False)
+
+
+PAGE_FIELDS = (
+    "page_id", "title", "url", "path", "section", "topic", "is_archive",
+    "version", "author_id", "author_name", "last_modifier_id", "last_modifier_name",
+    "created_at", "modified_at", "raw_html", "raw_text", "status", "edm_links",
+)
+ATTACHMENT_FIELDS = (
+    "attachment_id", "page_id", "filename", "media_type", "download_url",
+)
+RESULT_FIELDS = (
+    "status", "processed_version", "storage_path", "raw_text", "visual_summary",
+    "structed_content", "error",
+)
+RUN_FIELDS = ("mode", "status", "started_at", "finished_at", "window_to", "stats", "error")
+
+
+def field_values(record, fields):
+    # Dictionaries use JSONB; edm_links is passed directly as a PostgreSQL array.
+    return tuple(
+        encode(value) if name in ("structed_content", "stats") and value is not None else value
+        for name in fields for value in (getattr(record, name),)
+    )
+
+
+def upsert_sql(table, fields, keys, extra_updates=()):
+    columns = ",".join(fields)
+    placeholders = ",".join("%s::jsonb" if f in ("structed_content", "stats") else "%s" for f in fields)
+    updates = [f"{f}=EXCLUDED.{f}" for f in fields if f not in keys]
+    updates.extend(extra_updates)
+    return (f"INSERT INTO public.{table}({columns}) VALUES ({placeholders}) "
+            f"ON CONFLICT({','.join(keys)}) DO UPDATE SET {','.join(updates)}")
+
+
+def chunk_rows(parent_id, chunks):
+    rows = []
+    indices = set()
+    dimension = None
+    for chunk in chunks:
+        if type(chunk.chunk_index) is not int or chunk.chunk_index < 0:
+            raise ValueError("chunk_index must be a nonnegative integer")
+        if chunk.chunk_index in indices:
+            raise ValueError("Duplicate chunk_index in chunk snapshot")
+        indices.add(chunk.chunk_index)
+        embedding = chunk.embedding
+        if not isinstance(embedding, list) or not embedding:
+            raise ValueError("embedding must be a nonempty list of numbers")
+        if any(type(v) not in (int, float) or not math.isfinite(v) or abs(v) > 3.4028234663852886e38
+               for v in embedding):
+            raise ValueError("embedding values must be finite float32 numbers")
+        if dimension is None:
+            dimension = len(embedding)
+        elif len(embedding) != dimension:
+            raise ValueError("Chunk embeddings must have the same dimensions")
+        rows.append((parent_id, chunk.chunk_index, chunk.content,
+                     json.dumps(embedding, allow_nan=False)))
+    return rows
+
+
+def replace_chunks(cursor, table, parent_field, parent_id, chunks):
+    if (table, parent_field) not in (("cf_chunks_page", "page_id"),
+                                   ("cf_chunks_attach", "attachment_id")):
+        raise ValueError("Unknown chunk table or parent field")
+    rows = chunk_rows(parent_id, chunks)
+    cursor.execute(
+        f"DELETE FROM public.{table} WHERE {parent_field}=%s "
+        "AND NOT (chunk_index=ANY(%s::integer[]))",
+        (parent_id, [row[1] for row in rows]),
+    )
+    for row in rows:
+        cursor.execute(
+            f"INSERT INTO public.{table}({parent_field},chunk_index,content,embedding) "
+            "VALUES (%s,%s,%s,%s::public.vector) "
+            f"ON CONFLICT({parent_field},chunk_index) DO UPDATE SET "
+            "content=EXCLUDED.content,embedding=EXCLUDED.embedding",
+            row,
+        )
+
+
+def write_page(conn, change):
+    with conn.cursor() as cursor:
+        if hasattr(change, "page"):
+            page = change.page
+            if any(a.page_id != page.page_id for a in change.attachments):
+                raise ValueError("AttachmentRecord.page_id does not match PageRecord.page_id")
+            cursor.execute(upsert_sql("cf_pages", PAGE_FIELDS, ("page_id",),
+                                      ("updated_at=now()",)) +
+                           " WHERE cf_pages.version IS NULL OR EXCLUDED.version >= cf_pages.version",
+                           field_values(page, PAGE_FIELDS))
+            if cursor.rowcount == 0:
+                # An old or unversioned snapshot must not replace newer children.
+                return False
+            # Lists are complete snapshots. Results survive metadata replay.
+            attachment_ids = [a.attachment_id for a in change.attachments]
+            cursor.execute(
+                "DELETE FROM public.cf_attachments WHERE page_id=%s "
+                "AND NOT (attachment_id=ANY(%s::text[]))", (page.page_id, attachment_ids)
+            )
+            for attachment in change.attachments:
+                cursor.execute(
+                    "INSERT INTO public.cf_attachments(" + ",".join(ATTACHMENT_FIELDS) + ",status) "
+                    "VALUES (%s,%s,%s,%s,%s,%s) ON CONFLICT(attachment_id) DO UPDATE SET " +
+                    ",".join(f"{f}=EXCLUDED.{f}" for f in ATTACHMENT_FIELDS if f != "attachment_id") +
+                    ",updated_at=now()",
+                    field_values(attachment, ATTACHMENT_FIELDS) + (attachment.initial_status,),
+                )
+            replace_chunks(cursor, "cf_chunks_page", "page_id", page.page_id, change.chunks)
+        elif hasattr(change, "page_ids") and hasattr(change, "status"):
+            cursor.execute(
+                "UPDATE public.cf_pages SET status=%s,updated_at=now() WHERE page_id=ANY(%s::text[])",
+                (change.status, change.page_ids),
+            )
+        else:
+            raise TypeError(f"Unknown PageChange: {type(change).__name__}")
+    return True
+
+
+def write_image(conn, result):
+    with conn.cursor() as cursor:
+        cursor.execute(
+            "SELECT processed_version,status FROM public.cf_attachments "
+            "WHERE attachment_id=%s FOR UPDATE", (result.attachment_id,),
+        )
+        stored = cursor.fetchone()
+        if stored is None:
+            raise ValueError("AttachmentResult does not match a stored attachment")
+        stored_version, stored_status = stored
+        if stored_version is not None:
+            if result.processed_version is None or result.processed_version < stored_version:
+                return False
+            if (result.processed_version == stored_version and stored_status == "done"
+                    and result.status != "done"):
+                return False
+        assignments = ",".join(f"{f}=%s::jsonb" if f == "structed_content" else f"{f}=%s"
+                               for f in RESULT_FIELDS)
+        cursor.execute(
+            f"UPDATE public.cf_attachments SET {assignments},attempts=attempts+1,updated_at=now() "
+            "WHERE attachment_id=%s",
+            field_values(result, RESULT_FIELDS) + (result.attachment_id,),
+        )
+        if cursor.rowcount != 1:
+            raise ValueError("AttachmentResult does not match a stored attachment")
+        replace_chunks(cursor, "cf_chunks_attach", "attachment_id", result.attachment_id, result.chunks)
+    return True
+
+
+def save_run(conn, run_key, attempt, record):
+    with conn.cursor() as cursor:
+        placeholders = ",".join("%s::jsonb" if f == "stats" else "%s" for f in RUN_FIELDS)
+        cursor.execute(
+            f"INSERT INTO public.cf_ingest_runs({','.join(RUN_FIELDS)}) "
+            f"VALUES ({placeholders}) RETURNING run_id", field_values(record, RUN_FIELDS),
+        )
+        run_id = cursor.fetchone()[0]
+    conn.commit()
+    logging.getLogger(__name__).info("Saved ingestion run_id=%s run_key=%s attempt=%s", run_id, run_key, attempt)
+    return run_id
+
+
+def execute_ingest(conn, *, run_key, attempt, mode, modified_from=None,
+                   modified_to=None, image_max_minutes=None, **options):
+    if mode not in MODES:
+        raise ValueError(f"Unsupported ingestion mode: {mode}")
+    if conn.autocommit is True:
+        raise ValueError("Ingestion requires autocommit=False for atomic writes")
+    # Internal implementation supplied by the deployment environment.
+    from confluence_ingest import IngestRun
+
+    # Source state storage must use a separate connection from the sink.
+    run = IngestRun(
+        mode=mode, modified_from=modified_from, modified_to=modified_to,
+        run_key=run_key, **options,
+    )
+    counts = {"page_changes": 0, "image_results": 0}
+    try:
+        for change in run.page_changes():
+            write_page(conn, change)
+            conn.commit()
+            counts["page_changes"] += 1
+        for result in run.image_results(max_minutes=image_max_minutes):
+            write_image(conn, result)
+            conn.commit()
+            counts["image_results"] += 1
+    except BaseException as exc:
+        conn.rollback()
+        try:
+            save_run(conn, run_key, attempt, run.finish(error=exc))
+        except BaseException:
+            logging.getLogger(__name__).exception("Could not finalize failed ingestion")
+        raise
+    # finish advances source state only after all sink writes succeed.
+    save_run(conn, run_key, attempt, run.finish())
+    return counts
+
+
+def initialize_schema(conn):
+    with conn.cursor() as cursor:
+        cursor.execute((Path(__file__).parents[1] / "sql" / "schema.sql").read_text())
+    conn.commit()
